@@ -1,0 +1,158 @@
+version: 2
+
+workflows:
+  version: 2
+  build-test-deploy:
+    jobs:
+      # Docker イメージに組み込むアプリをビルドする
+      - build-production
+      # Docker イメージを実際にビルドしレジストリにプッシュする (具体的な処理内容はジョブの定義で説明します)
+      - build-docker-image:
+          # レジストリのホスト名, ユーザー名, パスワードをこの context に保存してあります
+          context: demo-docker-registry
+          requires:
+            - build-production
+      # おまけ: 自動デプロイ前に承認を求める
+      - wait-deploy-approval:
+          type: approval
+          requires:
+            - build-docker-image
+          filters:
+            branches:
+              only: main
+      # ビルドした Docker イメージをデプロイする (具体的な処理内容はジョブの定義で説明します)
+      - deploy-docker-image:
+          # レジストリのホスト名, ユーザー名, パスワードをこの context に保存してあります
+          context: demo-docker-registry
+          requires:
+            - wait-deploy-approval
+
+jobs:
+  # アプリを実際にビルドする (ここでは Webpack を使って単一の実行可能な JavaScript ファイルを作成しています)
+  build-production:
+    docker:
+      - image: node:current-alpine
+    steps:
+      - checkout
+      # ここでバージョン番号を決定
+      # `CIRCLE_BUILD_NUM` (CircleCI 上でのジョブ番号) と `CIRCLE_SHA1` (コミットのハッシュ) を使用して一意かつ意味のあるバージョン番号を決定します
+      # 決定したバージョン番号は後々の参照が楽なようにテキスト ファイルに書きだします
+      - run:
+          name: Compute version number
+          command: echo "0.0.${CIRCLE_BUILD_NUM}-${CIRCLE_SHA1:0:7}" | tee version.txt
+      # 参考: ここで依存関係キャッシュを有効にする
+      - restore_cache:
+          keys:
+            - yarn-deps-{{ checksum "yarn.lock" }}
+            - yarn-deps
+      # ここで依存パッケージのインストール
+      - run:
+          name: yarn install
+          command: yarn install
+      # 参考: ここで依存関係キャッシュを更新する
+      - save_cache:
+          paths:
+            - node_modules
+          key: yarn-deps-{{ checksum "yarn.lock" }}-{{ epoch }}
+      # 実際にビルドする
+      - run:
+          name: Production build
+          command: |
+            export __BUILD_VERSION="$(cat version.txt)"
+            yarn build
+      - store_artifacts:
+          path: dist/server.js
+      # ビルド結果はワークスペースを使って後続のジョブで利用
+      - persist_to_workspace:
+          root: .
+          paths:
+            - .
+
+  # Docker イメージをビルドしてレジストリにプッシュする
+  # 先行するジョブで作成した JavaScript ファイルを Docker イメージに組み込みます
+  # 作成した Docker イメージはバージョン番号を付加してレジストリにプッシュします (これをしておくことで任意のバージョンへ容易にアップグレード・ロールバックできるようになります)
+  build-docker-image:
+    # Docker イメージをビルドするため, machine エグゼキュターを使用します
+    # (ビルドを可能な限りクリーンかつ安価な環境で実行するためジョブを分けています)
+    machine:
+      image: default
+      docker_layer_caching: true
+    environment:
+      # Docker イメージ名は環境変数としてセットしておきます
+      DOCKER_IMAGE_NAME: makotom/azcci-server
+    steps:
+      - attach_workspace:
+          at: .
+      # Docker イメージのフルネーム (レジストリ名 + イメージ名 + タグ) をあらかじめ計算し環境変数にセットします
+      # タグにはビルドのタイミングで決定したバージョン番号を含めます
+      # 環境変数 `DOCKER_REGISTRY` は context で設定し渡しています
+      - run:
+          name: Setup DOCKER_IMAGE_REF envvar
+          command: |
+            export __BUILD_VERSION="$(cat version.txt)"
+            echo "export DOCKER_IMAGE_REF=$DOCKER_REGISTRY/$DOCKER_IMAGE_NAME:$__BUILD_VERSION" >> $BASH_ENV
+      # `docker login` を最初に実行します (Docker Hub の API コール回数制限を回避するため)
+      # 環境変数 `DOCKER_REGISTRY` `DOCKER_LOGIN` `DOCKER_PASSWORD` は context で設定し渡しています
+      - run:
+          name: docker login
+          command: |
+            docker login -u $DOCKER_LOGIN --password-stdin $DOCKER_REGISTRY << EOD
+            $DOCKER_PASSWORD
+            EOD
+      # `docker build` コマンドで Docker イメージをビルドします
+      - run:
+          name: docker build
+          command: docker build -t $DOCKER_IMAGE_REF .
+      # `docker push` コマンドで作成した Dockr イメージを push します
+      - run:
+          name: docker push
+          command: docker push $DOCKER_IMAGE_REF
+
+  # ビルドした Docker イメージをデプロイする
+  # この例では Azure App Service と Azure Container Registry の組み合わせでローリング アップデートが設定されている前提で
+  # 先行するジョブで作成した Docker イメージを `latest` タグで再プッシュしデプロイをトリガーします
+  # このあたりのデプロイ パターンは技術スタック依存ですので, 用途に合わせて改造するとよいと思います
+  # (Amazon ECS と Amazon ECR の組み合わせを使用し Task Definition を更新するのもよいですし, Ansible などを組み合わせて使うというのもアリだと思います)
+  deploy-docker-image:
+    machine: true
+    environment:
+      # Docker イメージ名は環境変数としてセットしておきます
+      DOCKER_IMAGE_NAME: makotom/azcci-server
+    steps:
+      - attach_workspace:
+          at: .
+      # バージョン番号を環境変数にセットします
+      - run:
+          name: Setup __BUILD_VERSION envvar
+          command: |
+            echo "export __BUILD_VERSION=\"$(cat version.txt)\"" | tee -a $BASH_ENV
+      # ここで, Docker の実験的機能を使用して, manifest のみを操作し, latest タグを更新します
+      # これを実現するため, まず ~/.docker/config.json を書き換えて, 実験的機能が使用できる状態にします
+      - run:
+          name: Enable `docker manifest` command
+          command: |
+            mkdir -p ~/.docker
+            if [ ! -f ~/.docker/config.json ]
+            then
+              echo '{}' > ~/.docker/config.json
+            fi
+
+            cat <<< $(jq '.experimental = "enabled"' ~/.docker/config.json) > ~/.docker/config.json
+      # 次に `docker login` を実行し, manifest を pull/push できる状態にします
+      - run:
+          name: docker login
+          command: |
+            docker login -u $DOCKER_LOGIN --password-stdin $DOCKER_REGISTRY << EOD
+            $DOCKER_PASSWORD
+            EOD
+      # 実際に manifest を操作します
+      # 具体的には,
+      #   1 行目: このワークフローで作成された, バージョン番号がタグ付けされている Docker イメージの manifest をダウンロードし, 新しい manifest を latest タグで作成します
+      #   2 行目: 新しい manifest のみを latest タグをつけたまま push します
+      # これにより, イメージ本体をダウンロード・アップロードすることなく高速に Docker レジストリ上の latest タグを更新することができます
+      # ここで, 最終デプロイ先の Azure App Service で自動ローリング アップデートが構成しておけば, latest タグが更新されると自動的に Azure 側で最新イメージのデプロイが開始されます
+      - run:
+          name: Update `latest` tag with this version
+          command: |
+            docker manifest create $DOCKER_REGISTRY/$DOCKER_IMAGE_NAME:latest $DOCKER_REGISTRY/$DOCKER_IMAGE_NAME:$__BUILD_VERSION
+            docker manifest push $DOCKER_REGISTRY/$DOCKER_IMAGE_NAME:latest
